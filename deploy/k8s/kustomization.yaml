@@ -1,0 +1,18 @@
+# webhookd Kubernetes manifests.
+# Apply:  kubectl apply -k deploy/k8s
+# PostgreSQL, Redis, and S3 are external managed services (design §13);
+# fill in deploy/k8s/secret.example.yaml and apply it separately.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: webhookd
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - api.yaml
+  - worker.yaml
+  - scheduler.yaml
+  - networkpolicy.yaml
+images:
+  - name: webhookd
+    newName: registry.example.com/webhookd
+    newTag: "1.0.0"

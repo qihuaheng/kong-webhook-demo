@@ -1,0 +1,6 @@
+.git
+.kiro
+deploy/k8s
+deploy/grafana
+docs
+**/*_test.go

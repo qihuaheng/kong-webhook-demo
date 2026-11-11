@@ -1,0 +1,25 @@
+# Defense in depth for SSRF (design §7): workers and schedulers may reach
+# the public internet but not cluster-internal or metadata addresses, in
+# addition to the application-level dial check. Adjust the dependency
+# CIDRs (PG/Redis/S3 endpoints, DNS) for your environment.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webhookd-egress
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: webhookd }
+  policyTypes: [Egress]
+  egress:
+    - to: # DNS
+        - namespaceSelector: {}
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+    - to: # managed dependencies (replace with real CIDRs)
+        - ipBlock: { cidr: 10.20.0.0/16 }
+      ports: [{ port: 5432 }, { port: 6379 }, { port: 443 }]
+    - to: # public internet only
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8]
+      ports: [{ port: 443 }, { port: 80 }]

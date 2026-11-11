@@ -1,0 +1,1020 @@
+openapi: 3.1.0
+info:
+  title: webhookd API
+  version: 1.0.0
+  summary: Reliable asynchronous webhook delivery.
+  description: |
+    webhookd accepts events from producers, fans them out to subscribed
+    endpoints, and delivers them as signed HTTP POSTs with at-least-once
+    semantics, exponential backoff + jitter retries, and a dead-letter queue.
+
+    ## Authentication
+    - Tenant APIs (`/v1/*`): `Authorization: Bearer <tenant_api_key>` (`whk_...`).
+    - Admin APIs (`/admin/v1/*`): `Authorization: Bearer <WEBHOOKD_ADMIN_KEY>`.
+
+    ## Conventions
+    - Request and response bodies are JSON. Errors are `{"error": "<message>"}`.
+    - IDs are prefixed ULIDs: `ten_` tenant, `ep_` endpoint, `evt_` event,
+      `msg_` delivery. A delivery ID is also the `webhook-id` header value.
+    - Durations are Go duration strings: `"500ms"`, `"5s"`, `"1h"`.
+    - Timestamps are RFC 3339 (UTC).
+    - List endpoints return newest first. To page, pass `next_before` from
+      the previous response as `before`.
+
+    ## Delivery semantics
+    - At-least-once. Receivers must deduplicate on `webhook-id`.
+    - No ordering guarantee. Use the envelope `timestamp` if order matters.
+    - Retried: timeouts, connection/DNS/TLS errors, 408, 429, 5xx.
+      Not retried: other 4xx, SSRF-blocked destinations, redirect limit exceeded.
+    - Redirects (301/302/303/307/308) are followed with POST and the original
+      body, up to `max_redirects`. https → http redirects are refused.
+    - `Retry-After` (on 429/503) acts as a floor for the next delay, capped at `max_delay`.
+    - The attempt `timeout` covers the whole attempt, including redirects.
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local docker-compose stack
+
+security:
+  - tenantKey: []
+
+tags:
+  - name: Events
+  - name: Endpoints
+  - name: Deliveries
+  - name: DLQ
+    description: Dead-letter queue (deliveries with status `dead`).
+  - name: Tenant
+  - name: Admin
+  - name: Operations
+
+paths:
+  /v1/events:
+    post:
+      tags: [Events]
+      operationId: publishEvent
+      summary: Publish an event
+      description: |
+        The event is fanned out to every **active** endpoint of the tenant whose
+        `event_types` match `event_type`, creating one delivery per endpoint.
+        A 202 means the event is durably stored (object storage + PostgreSQL)
+        and will reach a terminal state.
+
+        If no endpoint matches, the API returns 202 with empty `delivery_ids`
+        and stores nothing.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            Deduplicates retries for 24h per tenant. Takes precedence over the
+            `idempotency_key` body field. A duplicate returns the original
+            event with `duplicate: true` and creates no new deliveries.
+          schema: { type: string, maxLength: 256 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PublishEventRequest" }
+            example:
+              event_type: payment.succeeded
+              data: { payment_id: pay_123, amount: 4200, currency: EUR }
+      responses:
+        "202":
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishEventResponse" }
+              example:
+                event_id: evt_01M74DNPGR8AK1KSYKHKT2NGJN
+                delivery_ids: [msg_01M74DNPHCTTGWMZYZ7WMN4YZJ]
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: "`data` exceeds 256 KiB, or the request body is too large."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Storage temporarily unavailable. Retry with the same idempotency key.
+          headers:
+            Retry-After: { schema: { type: integer, example: 1 } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /v1/events/{id}:
+    get:
+      tags: [Events]
+      operationId: getEvent
+      summary: Get an event and its deliveries
+      parameters:
+        - $ref: "#/components/parameters/EventID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [event, deliveries]
+                properties:
+                  event: { $ref: "#/components/schemas/Event" }
+                  deliveries:
+                    type: array
+                    items: { $ref: "#/components/schemas/Delivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/endpoints:
+    post:
+      tags: [Endpoints]
+      operationId: createEndpoint
+      summary: Register an endpoint
+      description: |
+        Returns the endpoint and its signing secret. **The secret is returned
+        only once.** The URL is validated against SSRF rules: https only (http
+        only if the server allows it), no userinfo, no localhost, no
+        private/loopback/link-local/metadata IP literals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateEndpointRequest" }
+            example:
+              url: https://hooks.customer.example/payments
+              event_types: ["payment.*"]
+              compression: none
+              retry_policy: { max_attempts: 10, timeout: 5s }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoint, secret]
+                properties:
+                  endpoint: { $ref: "#/components/schemas/Endpoint" }
+                  secret: { $ref: "#/components/schemas/Secret" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    get:
+      tags: [Endpoints]
+      operationId: listEndpoints
+      summary: List endpoints
+      description: Returns all non-deleted endpoints of the tenant, active and disabled.
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoints]
+                properties:
+                  endpoints:
+                    type: array
+                    items: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/endpoints/{id}:
+    parameters:
+      - $ref: "#/components/parameters/EndpointID"
+    get:
+      tags: [Endpoints]
+      operationId: getEndpoint
+      summary: Get an endpoint
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoint]
+                properties:
+                  endpoint: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Endpoints]
+      operationId: updateEndpoint
+      summary: Update an endpoint
+      description: |
+        Only fields present in the body change. Subscription changes take effect
+        on the receiving API replica immediately and on other replicas within 10s.
+        Workers pick up URL, policy, and status changes within 5s.
+
+        Disabling an endpoint stops new fan-out to it. Its in-flight deliveries
+        move to the DLQ with reason `endpoint_disabled`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateEndpointRequest" }
+            example: { status: disabled }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [endpoint]
+                properties:
+                  endpoint: { $ref: "#/components/schemas/Endpoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Endpoints]
+      operationId: deleteEndpoint
+      summary: Delete an endpoint
+      description: |
+        Soft delete: the endpoint disappears from the API, but its delivery
+        history stays queryable. In-flight deliveries move to the DLQ with reason
+        `endpoint_disabled`.
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/endpoints/{id}/secret/rotate:
+    post:
+      tags: [Endpoints]
+      operationId: rotateSecret
+      summary: Rotate the signing secret
+      description: |
+        Issues a new secret. The previous secret remains valid for the grace
+        period (default 24h). During that period every delivery carries both
+        signatures in `webhook-signature`, so receivers can switch at any time.
+      parameters:
+        - $ref: "#/components/parameters/EndpointID"
+      responses:
+        "200":
+          description: Rotated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [secret, previous_valid_until]
+                properties:
+                  secret: { $ref: "#/components/schemas/Secret" }
+                  previous_valid_until: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/deliveries:
+    get:
+      tags: [Deliveries]
+      operationId: listDeliveries
+      summary: List deliveries
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: "#/components/schemas/DeliveryStatus" }
+        - $ref: "#/components/parameters/EndpointFilter"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - $ref: "#/components/parameters/Before"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/deliveries/{id}:
+    get:
+      tags: [Deliveries]
+      operationId: getDelivery
+      summary: Get a delivery
+      parameters:
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [delivery]
+                properties:
+                  delivery: { $ref: "#/components/schemas/Delivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/deliveries/{id}/attempts:
+    get:
+      tags: [Deliveries]
+      operationId: listAttempts
+      summary: List the HTTP attempts of a delivery
+      description: |
+        Returns one row per HTTP attempt, oldest first. Deferrals (circuit
+        breaker open, concurrency cap) are not attempts and are not listed.
+      parameters:
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [attempts]
+                properties:
+                  attempts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Attempt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/dlq:
+    get:
+      tags: [DLQ]
+      operationId: listDLQ
+      summary: List dead deliveries
+      parameters:
+        - $ref: "#/components/parameters/EndpointFilter"
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - $ref: "#/components/parameters/Before"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: OK.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/dlq/{id}/replay:
+    post:
+      tags: [DLQ]
+      operationId: replayDelivery
+      summary: Replay one dead delivery
+      description: |
+        Moves the delivery back to `pending` with `attempt` reset to 0 and
+        enqueues it. The `webhook-id` (delivery ID) is unchanged, so receivers
+        can deduplicate. Attempt history is kept.
+      parameters:
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "202":
+          description: Replay scheduled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReplayResponse" }
+              example: { replayed: 1, delivery_ids: [msg_01M74DNPHCTTGWMZYZ7WMN4YZJ] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The delivery is not dead, or it changed concurrently.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410":
+          description: The payload has expired (10-day retention) and the delivery cannot be replayed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/dlq/replay:
+    post:
+      tags: [DLQ]
+      operationId: replayBulk
+      summary: Replay dead deliveries in bulk
+      description: |
+        Replays up to `limit` dead deliveries matching the filter (oldest first)
+        in one synchronous call. Call repeatedly until `replayed` is 0.
+        Deliveries whose payload has expired end up dead again with reason
+        `payload_expired`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BulkReplayRequest" }
+            example: { endpoint_id: ep_01M74DNPGN0JP8TAS94S5PZEP7, limit: 500 }
+      responses:
+        "202":
+          description: Replay scheduled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReplayResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/dlq/{id}:
+    delete:
+      tags: [DLQ]
+      operationId: deleteDeadDelivery
+      summary: Permanently delete a dead delivery
+      description: Only deliveries with status `dead` can be deleted.
+      parameters:
+        - $ref: "#/components/parameters/DeliveryID"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Not found, or the delivery is not dead.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/tenant/notify:
+    put:
+      tags: [Tenant]
+      operationId: setNotifyURL
+      summary: Configure DLQ notifications
+      description: |
+        Sets the URL that receives signed `webhook.delivery.dead` notifications
+        (see `webhooks.deliveryDead`). Each call issues a new signing secret,
+        returned only once. An empty `url` disables notifications.
+
+        Per endpoint, the first dead delivery after a quiet period is notified
+        immediately. Further ones within the next 10 minutes are sent as one
+        summary when the window ends. Notifications are retried 3 times and
+        never enter the DLQ.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  description: Same SSRF validation as endpoint URLs. Empty string disables.
+            example: { url: https://ops.customer.example/webhookd-alerts }
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [url, secret]
+                    properties:
+                      url: { type: string, format: uri }
+                      secret: { $ref: "#/components/schemas/Secret" }
+                  - type: object
+                    description: Notifications disabled.
+                    required: [url]
+                    properties:
+                      url: { type: "null" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /admin/v1/tenants:
+    post:
+      tags: [Admin]
+      operationId: createTenant
+      summary: Create a tenant
+      description: Returns the tenant and its API key. **The API key is returned only once.**
+      security:
+        - adminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 200 }
+                retry_policy: { $ref: "#/components/schemas/RetryPolicy" }
+            example: { name: acme, retry_policy: { max_attempts: 12 } }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant, api_key]
+                properties:
+                  tenant: { $ref: "#/components/schemas/Tenant" }
+                  api_key:
+                    type: string
+                    pattern: "^whk_[A-Za-z0-9_-]{43}$"
+                    example: whk_q3Zk9...
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+          content: { text/plain: { schema: { type: string, example: ok } } }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: Checks PostgreSQL, Redis, and object storage connectivity (2s timeout).
+      security: []
+      responses:
+        "200":
+          description: Ready.
+          content: { text/plain: { schema: { type: string, example: ok } } }
+        "503":
+          description: A dependency is unavailable.
+          content: { text/plain: { schema: { type: string, example: "not ready: redis: connection refused" } } }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Exposed on the API port by `api`/`all` roles, and on `:9090` by `worker`
+        and `scheduler`. Key series: `webhook_events_ingested_total`,
+        `webhook_delivery_attempts_total`, `webhook_delivery_duration_seconds`,
+        `webhook_delivery_e2e_latency_seconds`, `webhook_deliveries_dead_total`,
+        `webhook_queue_lag`, `webhook_retry_backlog`, `webhook_circuit_transitions_total`.
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content: { text/plain: { schema: { type: string } } }
+
+webhooks:
+  eventDelivery:
+    post:
+      summary: Event delivered to a registered endpoint
+      description: |
+        Sent by webhookd to an endpoint URL for each matching event.
+
+        **Verifying:** compute
+        `base64(HMAC-SHA256(secret_bytes, "{webhook-id}.{webhook-timestamp}.{body}"))`,
+        where `secret_bytes` is the base64-decoded part after `whsec_` and
+        `body` is the **uncompressed** request body. Compare it in constant time
+        with each `v1,` entry of `webhook-signature`. Reject timestamps more than
+        5 minutes from now. The Go SDK provides `webhook.VerifyRequest`, which also
+        decodes zstd.
+
+        **Responding:** return any 2xx within the timeout (default 10s) to
+        acknowledge. Respond quickly and process asynchronously.
+      parameters:
+        - $ref: "#/components/parameters/WebhookID"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+        - name: content-encoding
+          in: header
+          required: false
+          description: Present only for endpoints with `compression = zstd`.
+          schema: { type: string, enum: [zstd] }
+        - name: user-agent
+          in: header
+          schema: { type: string, example: webhookd/1.0 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EventEnvelope" }
+            example:
+              type: payment.succeeded
+              timestamp: "2026-11-11T04:25:48.344Z"
+              data: { payment_id: pay_123, amount: 4200, currency: EUR }
+      responses:
+        "2XX": { description: Acknowledged. The delivery becomes `succeeded`. }
+        "408": { description: Retried. }
+        "429": { description: Retried. `Retry-After` is honored. }
+        "4XX": { description: Not retried. The delivery goes to the DLQ (`non_retryable_status`). }
+        "5XX": { description: Retried. `Retry-After` is honored on 503. }
+
+  deliveryDead:
+    post:
+      summary: DLQ notification to the tenant's notify URL
+      description: |
+        Signed like `eventDelivery`, using the secret returned by
+        `PUT /v1/tenant/notify`. The `webhook-id` is a fresh `ntf_` ID.
+      parameters:
+        - $ref: "#/components/parameters/WebhookID"
+        - $ref: "#/components/parameters/WebhookTimestamp"
+        - $ref: "#/components/parameters/WebhookSignature"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, timestamp, data]
+              properties:
+                type: { type: string, const: webhook.delivery.dead }
+                timestamp: { type: string, format: date-time }
+                data: { $ref: "#/components/schemas/DeadNotification" }
+            example:
+              type: webhook.delivery.dead
+              timestamp: "2026-11-11T04:40:00Z"
+              data:
+                endpoint_id: ep_01M74DNPGN0JP8TAS94S5PZEP7
+                count: 37
+                reason: exhausted
+                sample_delivery_id: msg_01M74DNRPEXW1Q3T1N04N5QWFF
+                window_start: "2026-11-11T04:30:00Z"
+                window_end: "2026-11-11T04:40:00Z"
+      responses:
+        "2XX": { description: Acknowledged. }
+
+components:
+  securitySchemes:
+    tenantKey:
+      type: http
+      scheme: bearer
+      description: Tenant API key (`whk_...`) returned by `POST /admin/v1/tenants`.
+    adminKey:
+      type: http
+      scheme: bearer
+      description: The server's `WEBHOOKD_ADMIN_KEY`.
+
+  parameters:
+    EventID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^evt_[0-9A-HJKMNP-TV-Z]{26}$" }
+    EndpointID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^ep_[0-9A-HJKMNP-TV-Z]{26}$" }
+    DeliveryID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^msg_[0-9A-HJKMNP-TV-Z]{26}$" }
+    EndpointFilter:
+      name: endpoint_id
+      in: query
+      schema: { type: string }
+    Since:
+      name: since
+      in: query
+      description: Lower bound on `created_at` (inclusive). Default is until − 31 days.
+      schema: { type: string, format: date-time }
+    Until:
+      name: until
+      in: query
+      description: Upper bound on `created_at` (exclusive). Default is now.
+      schema: { type: string, format: date-time }
+    Before:
+      name: before
+      in: query
+      description: Page cursor. Returns deliveries with an ID lower than this.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+    WebhookID:
+      name: webhook-id
+      in: header
+      required: true
+      description: Unique message ID, stable across retries and replays. Deduplicate on it.
+      schema: { type: string, example: msg_01M74DNPHCTTGWMZYZ7WMN4YZJ }
+    WebhookTimestamp:
+      name: webhook-timestamp
+      in: header
+      required: true
+      description: Unix seconds when this attempt was signed. Refreshed on every attempt.
+      schema: { type: string, example: "1794371148" }
+    WebhookSignature:
+      name: webhook-signature
+      in: header
+      required: true
+      description: |
+        Space-separated list of `v1,<base64>` signatures. There are two during
+        secret rotation. The `v1a,` prefix (Ed25519) is reserved.
+      schema:
+        type: string
+        example: "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE= v1,bm9wZS1vbGQtc2VjcmV0LXNpZ25hdHVyZQ=="
+
+  responses:
+    BadRequest:
+      description: Validation failed or the body is not valid JSON.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: "retry_policy: timeout must be in [1s,30s]" }
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: invalid api key }
+    NotFound:
+      description: Not found (or owned by another tenant).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: not found }
+    Internal:
+      description: Unexpected server error. Details are logged with the request ID.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: internal error }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    Duration:
+      type: string
+      description: Go duration string.
+      pattern: "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$"
+      examples: ["500ms", "5s", "1h"]
+
+    EventType:
+      type: string
+      description: Dot-separated segments of `[A-Za-z0-9_-]`.
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$"
+      examples: [payment.succeeded, monitor.alert_fired]
+
+    EventTypePattern:
+      type: string
+      description: "`*` (all), an exact type, or a prefix wildcard such as `payment.*`."
+      maxLength: 128
+      pattern: "^(\\*|[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*(\\.\\*)?)$"
+      examples: ["*", "payment.*", "monitor.alert_fired"]
+
+    Secret:
+      type: string
+      description: Signing secret, `whsec_` followed by base64 of 32 random bytes. Store it securely.
+      pattern: "^whsec_[A-Za-z0-9+/]{43}=$"
+      example: whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSwAAAAAAAAAAA=
+
+    RetryPolicy:
+      type: object
+      description: |
+        Partial retry policy. Omitted fields inherit from the next level:
+        endpoint → tenant → global default. Delay before retry *n* is
+        `min(max_delay, base_delay × multiplier^(n−1))` with jitter applied.
+        The nominal total window, summed over all retries, must be ≤ 72h.
+      additionalProperties: false
+      properties:
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 15
+          description: Total HTTP attempts, including the first.
+        base_delay:
+          allOf: [{ $ref: "#/components/schemas/Duration" }]
+          default: 5s
+          description: Minimum 1s.
+        multiplier:
+          type: number
+          minimum: 1
+          maximum: 10
+          default: 2.0
+        max_delay:
+          allOf: [{ $ref: "#/components/schemas/Duration" }]
+          default: 1h
+          description: Must be ≥ base_delay.
+        jitter:
+          type: string
+          enum: [equal, full]
+          default: equal
+          description: "`equal`: delay/2 + rand[0, delay/2]. `full`: rand[0, delay]."
+        timeout:
+          allOf: [{ $ref: "#/components/schemas/Duration" }]
+          default: 10s
+          description: Per attempt, including redirects. Range [1s, 30s].
+        max_redirects:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 3
+
+    PublishEventRequest:
+      type: object
+      required: [event_type, data]
+      properties:
+        event_type: { $ref: "#/components/schemas/EventType" }
+        data:
+          description: Any JSON value, at most 256 KiB serialized. Delivered verbatim as `data`.
+        idempotency_key:
+          type: string
+          maxLength: 256
+          description: Same as the `Idempotency-Key` header. The header wins if both are set.
+
+    PublishEventResponse:
+      type: object
+      required: [event_id, delivery_ids]
+      properties:
+        event_id: { type: string, example: evt_01M74DNPGR8AK1KSYKHKT2NGJN }
+        delivery_ids:
+          type: array
+          items: { type: string }
+          description: One per matched endpoint. Empty if nothing matched.
+        duplicate:
+          type: boolean
+          description: Present and true when the idempotency key matched an earlier event.
+
+    Event:
+      type: object
+      required: [id, tenant_id, event_type, payload_size, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        event_type: { $ref: "#/components/schemas/EventType" }
+        payload_size: { type: integer, description: Size of the delivered envelope in bytes, uncompressed. }
+        idempotency_key: { type: string }
+        created_at: { type: string, format: date-time }
+
+    EventEnvelope:
+      type: object
+      description: The request body delivered to endpoints.
+      required: [type, timestamp, data]
+      properties:
+        type: { $ref: "#/components/schemas/EventType" }
+        timestamp: { type: string, format: date-time, description: When the event was accepted. }
+        data: { description: The `data` value supplied by the producer. }
+
+    EndpointBase:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        description: { type: string, maxLength: 1000 }
+        event_types:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: "#/components/schemas/EventTypePattern" }
+        status:
+          type: string
+          enum: [active, disabled]
+        compression:
+          type: string
+          enum: [none, zstd]
+          description: "`zstd` sends `Content-Encoding: zstd`. The signature still covers the uncompressed body."
+        retry_policy: { $ref: "#/components/schemas/RetryPolicy" }
+        max_concurrency:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: In-flight requests per worker pod for this endpoint. 0 = server default (50).
+
+    CreateEndpointRequest:
+      allOf:
+        - $ref: "#/components/schemas/EndpointBase"
+        - type: object
+          required: [url, event_types]
+          properties:
+            status: { default: active }
+            compression: { default: none }
+            max_concurrency: { default: 0 }
+
+    UpdateEndpointRequest:
+      allOf:
+        - $ref: "#/components/schemas/EndpointBase"
+        - type: object
+          properties:
+            retry_policy:
+              description: Replaces the endpoint's retry policy override as a whole.
+            clear_retry_policy:
+              type: boolean
+              description: Remove the endpoint override and inherit tenant/global settings.
+
+    Endpoint:
+      type: object
+      required: [id, tenant_id, url, event_types, status, sign_alg, compression, max_concurrency, created_at, updated_at]
+      properties:
+        id: { type: string, example: ep_01M74DNPGN0JP8TAS94S5PZEP7 }
+        tenant_id: { type: string }
+        url: { type: string, format: uri }
+        description: { type: string }
+        event_types:
+          type: array
+          items: { $ref: "#/components/schemas/EventTypePattern" }
+        status: { type: string, enum: [active, disabled] }
+        sign_alg:
+          type: string
+          enum: [hmac-sha256]
+          description: "`ed25519` is reserved for a future release."
+        compression: { type: string, enum: [none, zstd] }
+        retry_policy: { $ref: "#/components/schemas/RetryPolicy" }
+        max_concurrency: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    DeliveryStatus:
+      type: string
+      enum: [pending, retrying, succeeded, dead]
+      description: |
+        `pending` → first attempt not yet made (or replayed).
+        `retrying` → waiting for the next attempt.
+        `succeeded` and `dead` are terminal.
+
+    DeadReason:
+      type: string
+      enum: [exhausted, non_retryable_status, too_many_redirects, ssrf_blocked, endpoint_disabled, payload_expired]
+
+    Delivery:
+      type: object
+      required: [id, event_id, endpoint_id, tenant_id, status, attempt, created_at, updated_at]
+      properties:
+        id: { type: string, description: Also the `webhook-id` header value. }
+        event_id: { type: string }
+        endpoint_id: { type: string }
+        tenant_id: { type: string }
+        status: { $ref: "#/components/schemas/DeliveryStatus" }
+        attempt: { type: integer, description: HTTP attempts made so far. Reset to 0 on replay. }
+        next_attempt_at:
+          type: string
+          format: date-time
+          description: Only for `pending`/`retrying`.
+        last_status_code: { type: integer }
+        last_error: { type: string, example: timeout }
+        dead_reason: { $ref: "#/components/schemas/DeadReason" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+
+    DeliveryPage:
+      type: object
+      required: [deliveries]
+      properties:
+        deliveries:
+          type: array
+          items: { $ref: "#/components/schemas/Delivery" }
+        next_before:
+          type: string
+          description: Present when the page is full. Pass it as `before` to get the next page.
+
+    Attempt:
+      type: object
+      required: [delivery_id, attempt, started_at, duration_ms, redirects]
+      properties:
+        delivery_id: { type: string }
+        attempt: { type: integer, minimum: 1 }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: integer }
+        status_code: { type: integer, description: Absent when no HTTP response was received. }
+        error: { type: string, examples: [timeout, "HTTP 503", "exceeded 3 redirects"] }
+        response_body: { type: string, maxLength: 4096, description: First 4 KiB of the response body. }
+        redirects: { type: integer }
+
+    BulkReplayRequest:
+      type: object
+      properties:
+        endpoint_id: { type: string }
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
+        limit: { type: integer, minimum: 1, maximum: 1000, default: 1000 }
+
+    ReplayResponse:
+      type: object
+      required: [replayed, delivery_ids]
+      properties:
+        replayed: { type: integer }
+        delivery_ids:
+          type: array
+          items: { type: string }
+
+    Tenant:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string, example: ten_01M74DNPG0A1B2C3D4E5F6G7H8 }
+        name: { type: string }
+        notify_url: { type: string, format: uri }
+        retry_policy: { $ref: "#/components/schemas/RetryPolicy" }
+        created_at: { type: string, format: date-time }
+
+    DeadNotification:
+      type: object
+      required: [endpoint_id, count, reason, sample_delivery_id, window_start, window_end]
+      properties:
+        endpoint_id: { type: string }
+        count: { type: integer, minimum: 1, description: Dead deliveries in the window. }
+        reason: { $ref: "#/components/schemas/DeadReason" }
+        sample_delivery_id: { type: string, description: The most recent dead delivery. }
+        window_start: { type: string, format: date-time }
+        window_end: { type: string, format: date-time }
